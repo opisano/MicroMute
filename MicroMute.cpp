@@ -22,9 +22,6 @@ BOOL				InitInstance(HINSTANCE, int);
 LRESULT CALLBACK	WndProc(HWND, UINT, WPARAM, LPARAM);
 
 
-// tray icon message
-enum { MY_TRAY_ICON = WM_USER+1 };
-
 int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPTSTR    lpCmdLine,
@@ -88,7 +85,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
 	wcex.hbrBackground	= (HBRUSH)(COLOR_WINDOW+1);
 	wcex.lpszMenuName	= MAKEINTRESOURCE(IDC_MICROMUTE);
 	wcex.lpszClassName	= szWindowClass;
-	wcex.hIconSm		= LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
+	wcex.hIconSm		= LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_MICROMUTE));
 
 	return RegisterClassEx(&wcex);
 }
@@ -123,55 +120,6 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    return TRUE;
 }
 
-IMMDevice* soundInit()
-{
-    IMMDeviceEnumerator* deviceEnumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, 
-            CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), 
-            reinterpret_cast<LPVOID*>(&deviceEnumerator));
-
-    IMMDevice* defaultDevice = nullptr;
-    hr = deviceEnumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, 
-        &defaultDevice);
-
-    deviceEnumerator->Release();
-    deviceEnumerator = nullptr;
-
-    return defaultDevice;
-}
-
-BOOL isMute(IMMDevice* device)
-{
-    IAudioEndpointVolume* endpointVolume = nullptr;
-    HRESULT hr = device->Activate(__uuidof(IAudioEndpointVolume), 
-            CLSCTX_INPROC_SERVER, nullptr, 
-            reinterpret_cast<LPVOID*>(&endpointVolume));
-
-    BOOL bMute;
-    hr = endpointVolume->GetMute(&bMute);
-    endpointVolume->Release();
-
-    return bMute;
-}
-
-void setMute(IMMDevice* device, BOOL bMute)
-{
-    IAudioEndpointVolume* endpointVolume = nullptr;
-    HRESULT hr = device->Activate(__uuidof(IAudioEndpointVolume), 
-            CLSCTX_INPROC_SERVER, nullptr, 
-            reinterpret_cast<LPVOID*>(&endpointVolume));
-
-    hr = endpointVolume->SetMute(bMute, nullptr);
-    endpointVolume->Release();
-}
-
-BOOL switchMute()
-{
-    BOOL state = isMute(mike);
-    setMute(mike, !state);
-
-    return !state;
-}
 
 //
 //  FONCTION : WndProc(HWND, UINT, WPARAM, LPARAM)
@@ -185,17 +133,23 @@ BOOL switchMute()
 //
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    static CMicrophoneMuter muter(hWnd);
+
 	switch (message)
 	{
     case WM_CREATE:
         // At window creation
-        {        
+        {   
+            muter.Init();
+
             // create tray icon    
             ZeroMemory(&nid, sizeof(NOTIFYICONDATA));
             nid.cbSize = sizeof(NOTIFYICONDATA);
             nid.hWnd = hWnd;
             nid.uID = 0;
-            nid.hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_SMALL));
+
+            LPCTSTR iconStr = muter.IsMute() ? MAKEINTRESOURCE(IDI_OFF) : MAKEINTRESOURCE(IDI_ON);
+            nid.hIcon = LoadIcon(GetModuleHandle(nullptr), iconStr);
             nid.uCallbackMessage = MY_TRAY_ICON;
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             wcscpy_s(nid.szTip, _T("MicroMute"));
@@ -204,7 +158,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             // Register global keyboard shortcut
             hotKeyAtom = GlobalAddAtom(L"StarterHotKey");
             BOOL bHotKey = RegisterHotKey(hWnd, hotKeyAtom, 0, VK_SCROLL);
-            mike = soundInit();
+            muter.Init();
             break;
         }
     case WM_COMMAND:
@@ -215,12 +169,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     
     case MY_TRAY_ICON:
-        if (lParam == WM_LBUTTONUP)
-        {
-            BOOL state = switchMute();
-
-        }
-        else if (lParam == WM_RBUTTONUP)
+        if (lParam == WM_RBUTTONUP)
         {
             HMENU hmenu;
             HMENU hpopup;
@@ -234,8 +183,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
 
+    case MY_MICRO:
+        {
+            BOOL bMuted = static_cast<BOOL>(wParam);
+            LPCTSTR iconStr = bMuted ? MAKEINTRESOURCE(IDI_OFF) : MAKEINTRESOURCE(IDI_ON);
+            nid.hIcon = LoadIcon(GetModuleHandle(nullptr), iconStr);
+            Shell_NotifyIcon(NIM_MODIFY, &nid);
+        }
+        break;
+
     case WM_HOTKEY:
-        switchMute();
+        muter.SetMute(!muter.IsMute());
         break;
 
 	case WM_DESTROY:
@@ -257,3 +215,104 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return 0;
 }
 
+ULONG STDMETHODCALLTYPE CMicrophoneVolumeCallback::AddRef()
+{
+    return InterlockedIncrement(&m_ref);
+}
+
+ULONG STDMETHODCALLTYPE CMicrophoneVolumeCallback::Release()
+{
+    ULONG ulRef = InterlockedDecrement(&m_ref);
+    if (0 == ulRef)
+    {
+        delete this;
+    }
+    return ulRef;
+}
+
+HRESULT STDMETHODCALLTYPE CMicrophoneVolumeCallback::QueryInterface(REFIID riid, VOID** ppvInterface)
+{
+    if (IID_IUnknown == riid)
+    {
+        AddRef();
+        *ppvInterface = reinterpret_cast<IUnknown*>(this);
+    }
+    else if (__uuidof(IAudioEndpointVolumeCallback) == riid)
+    {
+        AddRef();
+        *ppvInterface = reinterpret_cast<IAudioEndpointVolumeCallback*>(this);
+    }
+    else
+    {
+        *ppvInterface = nullptr;
+        return E_NOINTERFACE;
+    }
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE  CMicrophoneVolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA pNotify)
+{
+    if (pNotify == nullptr)
+    {
+        return E_INVALIDARG;
+    }
+
+    // Alert listening window the micro status changed
+    PostMessage(m_hWndTarget, MY_MICRO, pNotify->bMuted, 0);
+
+    return S_OK;
+}
+
+BOOL CMicrophoneMuter::Init()
+{
+    // Get a device enumerator
+    IMMDeviceEnumerator* deviceEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, 
+            CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), 
+            reinterpret_cast<LPVOID*>(&deviceEnumerator));
+
+    if (FAILED(hr))
+    {
+        return FALSE;
+    }
+
+    // Get the microphone
+    IMMDevice* defaultDevice = nullptr;
+    hr = deviceEnumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, 
+        &defaultDevice);
+
+    deviceEnumerator->Release();
+    deviceEnumerator = nullptr;
+
+    if (FAILED(hr))
+    {            
+        return FALSE;
+    }
+
+    m_device = defaultDevice;
+
+    // Get the interface to volume control
+    m_endpointVolume = nullptr;
+    hr = m_device->Activate(__uuidof(IAudioEndpointVolume), 
+            CLSCTX_INPROC_SERVER, nullptr, 
+            reinterpret_cast<LPVOID*>(&m_endpointVolume));
+
+    if (FAILED(hr))
+    {
+        m_device->Release();
+        m_device = nullptr;
+        return FALSE;
+    }
+
+    hr = m_endpointVolume->RegisterControlChangeNotify(&m_callback);
+    if (FAILED(hr))
+    {
+        m_endpointVolume->Release();
+        m_endpointVolume = nullptr;
+        m_device->Release();
+        m_device = nullptr;
+        return FALSE;
+    }
+
+    return TRUE;
+}
